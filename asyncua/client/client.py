@@ -116,7 +116,9 @@ class Client:
 
         - ``Policy`` is ``Basic128Rsa15``, ``Basic256`` or ``Basic256Sha256``
         - ``Mode`` is ``Sign`` or ``SignAndEncrypt``
-        - ``certificate``, ``private_key`` and ``server_private_key`` are paths to ``.pem`` or ``.der`` files
+        - ``certificate`` and ``server_private_key`` are paths to ``.pem`` or ``.der`` files
+        - ``private_key`` may be a path to a ``.pem`` or ``.der`` file or a conjunction of ``path``::``password`` where
+          ``password`` is the private key password.
 
         Call this before connect()
         """
@@ -125,14 +127,22 @@ class Client:
         parts = string.split(",")
         if len(parts) < 4:
             raise ua.UaError("Wrong format: `{}`, expected at least 4 comma-separated values".format(string))
+
+        if '::' in parts[3]:  # if the filename contains a colon, assume it's a conjunction and parse it
+            parts[3], client_key_password = parts[3].split('::')
+        else:
+            client_key_password = None
+
         policy_class = getattr(security_policies, "SecurityPolicy{}".format(parts[0]))
         mode = getattr(ua.MessageSecurityMode, parts[1])
-        return await self.set_security(policy_class, parts[2], parts[3], parts[4] if len(parts) >= 5 else None, mode)
+        return await self.set_security(policy_class, parts[2], parts[3], client_key_password,
+                                       parts[4] if len(parts) >= 5 else None, mode)
 
     async def set_security(self,
                            policy,
                            certificate_path: str,
                            private_key_path: str,
+                           private_key_password: str = None,
                            server_certificate_path: str = None,
                            mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt):
         """
@@ -147,7 +157,7 @@ class Client:
         else:
             server_cert = await uacrypto.load_certificate(server_certificate_path)
         cert = await uacrypto.load_certificate(certificate_path)
-        pk = await uacrypto.load_private_key(private_key_path)
+        pk = await uacrypto.load_private_key(private_key_path, password=private_key_password)
         self.security_policy = policy(server_cert, cert, pk, mode)
         self.uaclient.set_security(self.security_policy)
 
@@ -330,7 +340,7 @@ class Client:
         # at least 32 random bytes for server to prove possession of private key (specs part 4, 5.6.2.2)
         nonce = create_nonce(32)
         params.ClientNonce = nonce
-        params.ClientCertificate = self.security_policy.client_certificate
+        params.ClientCertificate = self.security_policy.host_certificate
         params.ClientDescription = desc
         params.EndpointUrl = self.server_url.geturl()
         params.SessionName = f"{self.description} Session{self._session_counter}"
@@ -338,15 +348,15 @@ class Client:
         params.RequestedSessionTimeout = self.session_timeout
         params.MaxResponseMessageSize = 0  # means no max size
         response = await self.uaclient.create_session(params)
-        if self.security_policy.client_certificate is None:
+        if self.security_policy.host_certificate is None:
             data = nonce
         else:
-            data = self.security_policy.client_certificate + nonce
+            data = self.security_policy.host_certificate + nonce
         self.security_policy.asymmetric_cryptography.verify(data, response.ServerSignature.Signature)
         self._server_nonce = response.ServerNonce
-        if not self.security_policy.server_certificate:
-            self.security_policy.server_certificate = response.ServerCertificate
-        elif self.security_policy.server_certificate != response.ServerCertificate:
+        if not self.security_policy.peer_certificate:
+            self.security_policy.peer_certificate = response.ServerCertificate
+        elif self.security_policy.peer_certificate != response.ServerCertificate:
             raise ua.UaError("Server certificate mismatch")
         # remember PolicyId's: we will use them in activate_session()
         ep = Client.find_endpoint(response.ServerEndpoints, self.security_policy.Mode, self.security_policy.URI)
@@ -409,8 +419,8 @@ class Client:
         """
         params = ua.ActivateSessionParameters()
         challenge = b""
-        if self.security_policy.server_certificate is not None:
-            challenge += self.security_policy.server_certificate
+        if self.security_policy.peer_certificate is not None:
+            challenge += self.security_policy.peer_certificate
         if self._server_nonce is not None:
             challenge += self._server_nonce
         if self.security_policy.AsymmetricSignatureURI:
@@ -469,7 +479,7 @@ class Client:
         params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.UserName, "username_basic256")
 
     def _encrypt_password(self, password: str, policy_uri):
-        pubkey = uacrypto.x509_from_der(self.security_policy.server_certificate).public_key()
+        pubkey = uacrypto.x509_from_der(self.security_policy.peer_certificate).public_key()
         # see specs part 4, 7.36.3: if the token is encrypted, password
         # shall be converted to UTF-8 and serialized with server nonce
         passwd = password.encode("utf8")
@@ -535,9 +545,9 @@ class Client:
         await subscription.init()
         return subscription
 
-    def get_namespace_array(self) -> Coroutine:
+    async def get_namespace_array(self):
         ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
-        return ns_node.read_value()
+        return await ns_node.read_value()
 
     async def get_namespace_index(self, uri):
         uries = await self.get_namespace_array()
@@ -620,7 +630,7 @@ class Client:
         Read the value of multiple nodes in one ua call.
         """
         nodeids = [node.nodeid for node in nodes]
-        results = await self.uaclient.get_attributes(nodeids, ua.AttributeIds.Value)
+        results = await self.uaclient.read_attributes(nodeids, ua.AttributeIds.Value)
         return [result.Value.Value for result in results]
 
     async def write_values(self, nodes, values):
@@ -629,7 +639,7 @@ class Client:
         """
         nodeids = [node.nodeid for node in nodes]
         dvs = [value_to_datavalue(val) for val in values]
-        results = await self.uaclient.set_attributes(nodeids, dvs, ua.AttributeIds.Value)
+        results = await self.uaclient.write_attributes(nodeids, dvs, ua.AttributeIds.Value)
         for result in results:
             result.check()
 

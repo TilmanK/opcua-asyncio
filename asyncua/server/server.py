@@ -93,6 +93,8 @@ class Server:
             ua.SecurityPolicyType.NoSecurity, ua.SecurityPolicyType.Basic256Sha256_SignAndEncrypt,
             ua.SecurityPolicyType.Basic256Sha256_Sign
         ]
+        # allow all certificates by default
+        self._certificate_handler = None
         self._policyIDs = ["Anonymous", "Basic256Sha256", "Username"]
         self.certificate = None
 
@@ -128,8 +130,10 @@ class Server:
         # we also need to update all individual nodes :/
         product_uri_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductUri))
         product_name_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductName))
-        product_manufacturer_name_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ManufacturerName))
-        product_software_version_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_SoftwareVersion))
+        product_manufacturer_name_node = self.get_node(
+            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ManufacturerName))
+        product_software_version_node = self.get_node(
+            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_SoftwareVersion))
         product_build_number_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildNumber))
         product_build_date_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildDate))
 
@@ -150,7 +154,7 @@ class Server:
         return f"OPC UA Server({self.endpoint.geturl()})"
     __repr__ = __str__
 
-    async def load_certificate(self, path: str, format: str =None):
+    async def load_certificate(self, path: str, format: str = None):
         """
         load server certificate from file, either pem or der
         """
@@ -241,7 +245,7 @@ class Server:
     def get_endpoints(self) -> Coroutine:
         return self.iserver.get_endpoints()
 
-    def set_security_policy(self, security_policy):
+    def set_security_policy(self, security_policy, certificate_handler=None):
         """
         Method setting up the security policies for connections
         to the server, where security_policy is a list of integers.
@@ -260,6 +264,7 @@ class Server:
 
         """
         self._security_policy = security_policy
+        self._certificate_handler = certificate_handler
 
     def set_security_IDs(self, policy_ids):
         """
@@ -298,12 +303,12 @@ class Server:
                 self._policies.append(
                     ua.SecurityPolicyFactory(security_policies.SecurityPolicyBasic256Sha256,
                                              ua.MessageSecurityMode.SignAndEncrypt, self.certificate,
-                                             self.iserver.private_key))
+                                             self.iserver.private_key, certificate_handler=self._certificate_handler))
             if ua.SecurityPolicyType.Basic256Sha256_Sign in self._security_policy:
                 self._set_endpoints(security_policies.SecurityPolicyBasic256Sha256, ua.MessageSecurityMode.Sign)
                 self._policies.append(
                     ua.SecurityPolicyFactory(security_policies.SecurityPolicyBasic256Sha256,
-                                             ua.MessageSecurityMode.Sign, self.certificate, self.iserver.private_key))
+                                             ua.MessageSecurityMode.Sign, self.certificate, self.iserver.private_key, certificate_handler=self._certificate_handler))
 
     def _set_endpoints(self, policy=ua.SecurityPolicy, mode=ua.MessageSecurityMode.None_):
         idtokens = []
@@ -386,12 +391,6 @@ class Server:
         """
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.ObjectsFolder))
 
-    def get_server_node(self):
-        """
-        Get Server node of server. Returns a Node object.
-        """
-        return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.Server))
-
     def get_node(self, nodeid):
         """
         Get a specific node using NodeId object or a string representing a NodeId
@@ -416,23 +415,21 @@ class Server:
         await subscription.init()
         return subscription
 
-    def get_namespace_array(self) -> Coroutine:
+    async def get_namespace_array(self):
         """
         get all namespace defined in server
         """
-        ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
-        return ns_node.read_value()
+        return await self.nodes.namespace_array.read_value()
 
     async def register_namespace(self, uri) -> int:
         """
         Register a new namespace. Nodes should in custom namespace, not 0.
         """
-        ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
-        uries = await ns_node.read_value()
+        uries = await self.nodes.namespace_array.read_value()
         if uri in uries:
             return uries.index(uri)
         uries.append(uri)
-        await ns_node.write_value(uries)
+        await self.nodes.namespace_array.write_value(uries)
         return len(uries) - 1
 
     async def get_namespace_index(self, uri):
@@ -472,12 +469,12 @@ class Server:
         return await self._create_custom_type(idx, name, basetype, properties, [], [])
 
     async def create_custom_object_type(self,
-                                  idx,
-                                  name,
-                                  basetype=ua.ObjectIds.BaseObjectType,
-                                  properties=None,
-                                  variables=None,
-                                  methods=None) -> Coroutine:
+                                        idx,
+                                        name,
+                                        basetype=ua.ObjectIds.BaseObjectType,
+                                        properties=None,
+                                        variables=None,
+                                        methods=None) -> Coroutine:
         if properties is None:
             properties = []
         if variables is None:
@@ -490,12 +487,12 @@ class Server:
     # return self._create_custom_type(idx, name, basetype, properties)
 
     async def create_custom_variable_type(self,
-                                    idx,
-                                    name,
-                                    basetype=ua.ObjectIds.BaseVariableType,
-                                    properties=None,
-                                    variables=None,
-                                    methods=None) -> Coroutine:
+                                          idx,
+                                          name,
+                                          basetype=ua.ObjectIds.BaseVariableType,
+                                          properties=None,
+                                          variables=None,
+                                          methods=None) -> Coroutine:
         if properties is None:
             properties = []
         if variables is None:
@@ -622,9 +619,9 @@ class Server:
         """
         return load_enums(self)
 
-    def set_attribute_value(self, nodeid, datavalue, attr=ua.AttributeIds.Value):
+    async def write_attribute_value(self, nodeid, datavalue, attr=ua.AttributeIds.Value):
         """
         directly write datavalue to the Attribute, bypasing some checks and structure creation
         so it is a little faster
         """
-        return self.iserver.set_attribute_value(nodeid, datavalue, attr)
+        return await self.iserver.write_attribute_value(nodeid, datavalue, attr)
