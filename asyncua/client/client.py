@@ -483,7 +483,11 @@ class Client:
         """
         Close session
         """
-        self._renew_channel_task.cancel()
+        try:
+            self._renew_channel_task.cancel()
+        except AttributeError:
+            _logger.warning("close_Session was called but the renew_channel_task isn't active")
+            return None
         await self._renew_channel_task
         if not self.uaclient.protocol or self.uaclient.protocol.closed:
             _logger.info("close_session was called, but session is closed already")
